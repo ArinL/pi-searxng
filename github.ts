@@ -31,23 +31,56 @@ export interface ClonedRepo {
 }
 
 export function isGitHubUrl(url: string): boolean {
-  return url.includes("github.com") && 
+  return url.includes("github.com") &&
     /github\.com\/[^/]+\/[^/]+/.test(url);
 }
 
+interface GitHubUrlInfo {
+  owner: string;
+  repo: string;
+  ref?: string; // branch/tag from blob/tree URLs
+}
+
+function parseGitHubUrl(url: string): GitHubUrlInfo | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "github.com") return null;
+
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments.length < 2) return null;
+
+    const owner = segments[0];
+    const repo = segments[1].replace(/\.git$/, "");
+
+    // Handle blob/tree URLs: github.com/owner/repo/blob/main/path/to/file
+    let ref: string | undefined;
+    if (segments.length >= 4 && (segments[2] === "blob" || segments[2] === "tree")) {
+      ref = segments[3];
+    }
+
+    return { owner, repo, ref };
+  } catch {
+    return null;
+  }
+}
+
 export async function cloneRepo(url: string): Promise<ClonedRepo | null> {
-  const match = url.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/|$)/);
-  if (!match) return null;
-  
-  const [, owner, repo] = match;
-  const repoName = repo.replace(/\.git$/, "");
-  
+  const info = parseGitHubUrl(url);
+  if (!info) return null;
+
+  const { owner, repo, ref } = info;
   const tmpDir = mkdtempSync(join(tmpdir(), "pi-gh-"));
-  const cloneDir = join(tmpDir, repoName);
-  
+  const cloneDir = join(tmpDir, repo);
+
+  // Build clone URL and args
+  const cloneUrl = `https://github.com/${owner}/${repo}.git`;
+  const args = ["clone", "--depth", "1"];
+  if (ref) args.push("--branch", ref);
+  args.push(cloneUrl, cloneDir);
+
   try {
     await new Promise<void>((resolve, reject) => {
-      execFile("git", ["clone", "--depth", "1", url, cloneDir], {
+      execFile("git", args, {
         timeout: CLONE_TIMEOUT
       }, (err) => {
         if (err) reject(err);
