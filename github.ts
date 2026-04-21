@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
 
 const CLONE_TIMEOUT = 60000;
+const LS_REMOTE_TIMEOUT = 15000;
+const RAW_FETCH_TIMEOUT = 15000;
+const MAX_RAW_SIZE = 5 * 1024 * 1024;
 const MAX_FILES = 100;
+const CLONE_CACHE_TTL = 30 * 60_000;
+const CLONE_CACHE_MAX = 8;
 
 const BINARY_EXTS = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
@@ -24,10 +29,17 @@ export interface ClonedRepo {
   files: string[];
 }
 
+type CloneCacheEntry = {
+  tmpDir: string;
+  repo: ClonedRepo;
+  ts: number;
+};
+
 export interface RawFile {
   path: string;
   content: string;
   url: string;
+  error?: string;
 }
 
 export interface GitHubUrlInfo {
@@ -36,7 +48,10 @@ export interface GitHubUrlInfo {
   ref?: string;
   type?: "blob" | "tree";
   filePath?: string;
+  refPathSegments?: string[];
 }
+
+const cloneCache = new Map<string, CloneCacheEntry>();
 
 export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
   try {
@@ -52,15 +67,17 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
     let ref: string | undefined;
     let type: "blob" | "tree" | undefined;
     let filePath: string | undefined;
+    let refPathSegments: string[] | undefined;
     if (segments.length >= 4 && (segments[2] === "blob" || segments[2] === "tree")) {
       type = segments[2] as "blob" | "tree";
-      ref = segments[3];
-      if (segments.length > 4) {
-        filePath = segments.slice(4).join("/");
+      refPathSegments = segments.slice(3);
+      ref = refPathSegments[0];
+      if (refPathSegments.length > 1) {
+        filePath = refPathSegments.slice(1).join("/");
       }
     }
 
-    return { owner, repo, ref, type, filePath };
+    return { owner, repo, ref, type, filePath, refPathSegments };
   } catch {
     return null;
   }
@@ -72,12 +89,199 @@ export function isGitHubUrl(url: string): boolean {
     /github\.com\/[^/]+\/[^/]+/.test(url);
 }
 
-export async function fetchRawFile(info: GitHubUrlInfo): Promise<RawFile | null> {
+function isCommitSha(ref?: string): boolean {
+  return !!ref && /^[0-9a-f]{7,40}$/i.test(ref);
+}
+
+function isAmbiguousGitHubRef(info: GitHubUrlInfo): boolean {
+  return !!info.type &&
+    !!info.refPathSegments &&
+    info.refPathSegments.length > 1 &&
+    !isCommitSha(info.ref);
+}
+
+function getRefCandidates(info: GitHubUrlInfo): Array<{ ref: string; filePath?: string }> {
+  if (!info.refPathSegments || info.refPathSegments.length === 0) {
+    return info.ref ? [{ ref: info.ref, filePath: info.filePath }] : [];
+  }
+
+  const max = info.type === "blob" ? info.refPathSegments.length - 1 : info.refPathSegments.length;
+  const candidates: Array<{ ref: string; filePath?: string }> = [];
+
+  for (let i = max; i >= 1; i--) {
+    const ref = info.refPathSegments.slice(0, i).join("/");
+    const filePath = info.refPathSegments.slice(i).join("/") || undefined;
+    if (info.type === "blob" && !filePath) continue;
+    candidates.push({ ref, filePath });
+  }
+
+  return candidates;
+}
+
+async function listRemoteRefs(info: GitHubUrlInfo): Promise<Set<string>> {
+  const cloneUrl = `https://github.com/${info.owner}/${info.repo}.git`;
+
+  try {
+    const stdout = await new Promise<string>((resolve, reject) => {
+      execFile("git", ["ls-remote", "--heads", "--tags", cloneUrl], {
+        timeout: LS_REMOTE_TIMEOUT
+      }, (err, out) => {
+        if (err) reject(err);
+        else resolve(out);
+      });
+    });
+
+    const refs = new Set<string>();
+    for (const line of stdout.split("\n")) {
+      const ref = line.split("\t")[1];
+      if (!ref) continue;
+      if (ref.startsWith("refs/heads/")) {
+        refs.add(ref.slice("refs/heads/".length));
+      } else if (ref.startsWith("refs/tags/")) {
+        refs.add(ref.slice("refs/tags/".length).replace(/\^\{\}$/, ""));
+      }
+    }
+
+    return refs;
+  } catch {
+    return new Set();
+  }
+}
+
+async function resolveGitHubRef(info: GitHubUrlInfo): Promise<GitHubUrlInfo> {
+  const candidates = getRefCandidates(info);
+  if (candidates.length === 0) return info;
+  if (candidates.length === 1) return { ...info, ...candidates[0] };
+
+  const refs = await listRemoteRefs(info);
+  const match = candidates.find(candidate => refs.has(candidate.ref));
+  return match ? { ...info, ...match } : info;
+}
+
+function isBinaryContentType(contentType: string): boolean {
+  const normalized = contentType.toLowerCase();
+  return normalized.startsWith("image/") ||
+    normalized.startsWith("audio/") ||
+    normalized.startsWith("video/") ||
+    normalized.startsWith("font/") ||
+    normalized.includes("application/pdf") ||
+    normalized.includes("application/zip") ||
+    normalized.includes("application/gzip") ||
+    normalized.includes("application/x-gzip") ||
+    normalized.includes("application/x-bzip2") ||
+    normalized.includes("application/x-7z-compressed") ||
+    normalized.includes("application/x-rar-compressed");
+}
+
+function formatContentType(contentType: string): string {
+  return contentType.split(";")[0] || "unknown";
+}
+
+async function readTextWithLimit(res: Response, limit: number): Promise<string> {
+  if (!res.body) {
+    const text = await res.text();
+    if (new TextEncoder().encode(text).length > limit) {
+      throw new Error("Content too large");
+    }
+    return text;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let size = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel();
+      throw new Error("Content too large");
+    }
+
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+
+  chunks.push(decoder.decode());
+  return chunks.join("");
+}
+
+function shouldRetryResolvedRef(info: GitHubUrlInfo, error?: string): boolean {
+  return isAmbiguousGitHubRef(info) && !!error && error.startsWith("HTTP 404");
+}
+
+function isSameRefTarget(a: GitHubUrlInfo, b: GitHubUrlInfo): boolean {
+  return a.ref === b.ref && a.filePath === b.filePath;
+}
+
+function getCloneCacheKey(info: GitHubUrlInfo): string {
+  return `${info.owner}/${info.repo}@${info.ref || "HEAD"}`;
+}
+
+function removeCloneCacheEntry(key: string, entry: CloneCacheEntry): void {
+  cloneCache.delete(key);
+  rmSync(entry.tmpDir, { recursive: true, force: true });
+}
+
+function pruneCloneCache(): void {
+  const now = Date.now();
+
+  for (const [key, entry] of cloneCache.entries()) {
+    try {
+      if (now - entry.ts <= CLONE_CACHE_TTL && statSync(entry.repo.localPath).isDirectory()) {
+        continue;
+      }
+    } catch {}
+
+    removeCloneCacheEntry(key, entry);
+  }
+
+  while (cloneCache.size > CLONE_CACHE_MAX) {
+    const oldest = [...cloneCache.entries()].reduce((min, current) => current[1].ts < min[1].ts ? current : min);
+    removeCloneCacheEntry(oldest[0], oldest[1]);
+  }
+}
+
+function getCachedClone(info: GitHubUrlInfo): ClonedRepo | null {
+  pruneCloneCache();
+
+  const entry = cloneCache.get(getCloneCacheKey(info));
+  if (!entry) return null;
+
+  entry.ts = Date.now();
+  return entry.repo;
+}
+
+function setCachedClone(info: GitHubUrlInfo, tmpDir: string, repo: ClonedRepo): void {
+  pruneCloneCache();
+
+  cloneCache.set(getCloneCacheKey(info), {
+    tmpDir,
+    repo,
+    ts: Date.now()
+  });
+
+  pruneCloneCache();
+}
+
+async function fetchRawFileAt(info: GitHubUrlInfo): Promise<RawFile | null> {
   if (!info.filePath || !info.ref) return null;
 
   const rawUrl = `https://raw.githubusercontent.com/${info.owner}/${info.repo}/${info.ref}/${info.filePath}`;
+  if (BINARY_EXTS.has(extname(info.filePath).toLowerCase())) {
+    return {
+      path: info.filePath,
+      content: "",
+      url: rawUrl,
+      error: "Binary files are not supported"
+    };
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), RAW_FETCH_TIMEOUT);
 
   try {
     const res = await fetch(rawUrl, {
@@ -85,18 +289,63 @@ export async function fetchRawFile(info: GitHubUrlInfo): Promise<RawFile | null>
       headers: { "User-Agent": "pi-searxng/1.0" }
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      return {
+        path: info.filePath,
+        content: "",
+        url: rawUrl,
+        error: `HTTP ${res.status}`
+      };
+    }
 
-    const content = await res.text();
+    const contentLength = res.headers.get("content-length");
+    if (contentLength && Number(contentLength) > MAX_RAW_SIZE) {
+      return {
+        path: info.filePath,
+        content: "",
+        url: rawUrl,
+        error: "Content too large"
+      };
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType && isBinaryContentType(contentType)) {
+      return {
+        path: info.filePath,
+        content: "",
+        url: rawUrl,
+        error: `Unsupported content type: ${formatContentType(contentType)}`
+      };
+    }
+
+    const content = await readTextWithLimit(res, MAX_RAW_SIZE);
     return { path: info.filePath, content, url: rawUrl };
-  } catch {
-    return null;
+  } catch (err) {
+    return {
+      path: info.filePath,
+      content: "",
+      url: rawUrl,
+      error: err instanceof Error ? err.message : String(err)
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-export async function cloneRepo(info: GitHubUrlInfo): Promise<ClonedRepo | null> {
+export async function fetchRawFile(info: GitHubUrlInfo): Promise<RawFile | null> {
+  const initial = await fetchRawFileAt(info);
+  if (!initial || !shouldRetryResolvedRef(info, initial.error)) return initial;
+
+  const resolved = await resolveGitHubRef(info);
+  if (isSameRefTarget(resolved, info)) return initial;
+
+  return await fetchRawFileAt(resolved) || initial;
+}
+
+async function cloneRepoAt(info: GitHubUrlInfo): Promise<ClonedRepo | null> {
+  const cached = getCachedClone(info);
+  if (cached) return cached;
+
   const { owner, repo, ref } = info;
   const tmpDir = mkdtempSync(join(tmpdir(), "pi-gh-"));
   const cloneDir = join(tmpDir, repo);
@@ -117,11 +366,23 @@ export async function cloneRepo(info: GitHubUrlInfo): Promise<ClonedRepo | null>
     });
 
     const files = collectPaths(cloneDir, cloneDir);
-    return { localPath: cloneDir, files };
+    const clonedRepo = { localPath: cloneDir, files };
+    setCachedClone(info, tmpDir, clonedRepo);
+    return clonedRepo;
   } catch {
     rmSync(tmpDir, { recursive: true, force: true });
     return null;
   }
+}
+
+export async function cloneRepo(info: GitHubUrlInfo): Promise<ClonedRepo | null> {
+  const initial = await cloneRepoAt(info);
+  if (initial || !isAmbiguousGitHubRef(info)) return initial;
+
+  const resolved = await resolveGitHubRef(info);
+  if (isSameRefTarget(resolved, info)) return initial;
+
+  return await cloneRepoAt(resolved);
 }
 
 function collectPaths(dir: string, baseDir: string, paths: string[] = []): string[] {

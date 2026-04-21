@@ -109,10 +109,10 @@ export default function (pi: ExtensionAPI) {
 
       if (ghInfo?.type === "blob" && ghInfo.filePath) {
         const file = await fetchRawFile(ghInfo);
-        if (!file) {
+        if (!file || file.error) {
           return {
-            content: [{ type: "text", text: "Failed to fetch file from GitHub" }],
-            details: { error: "Raw fetch failed" }
+            content: [{ type: "text", text: file?.error ? `Error: ${file.error}` : "Failed to fetch file from GitHub" }],
+            details: { error: file?.error || "Raw fetch failed" }
           };
         }
 

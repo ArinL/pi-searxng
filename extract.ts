@@ -11,25 +11,105 @@ const DEFAULT_TIMEOUT = 30000;
 const MAX_SIZE = 5 * 1024 * 1024;
 const CACHE_TTL = 60_000;
 const CACHE_MAX = 50;
+type CacheMode = "full" | "headings";
+type CachePayload = Partial<Record<CacheMode, ExtractedContent>>;
+type CacheEntry = CachePayload & { ts: number };
 
-const urlCache = new Map<string, { content: ExtractedContent; ts: number }>();
+const urlCache = new Map<string, CacheEntry>();
 
-function getCached(url: string): ExtractedContent | null {
+function getCacheEntry(url: string): CacheEntry | null {
   const entry = urlCache.get(url);
   if (!entry) return null;
   if (Date.now() - entry.ts > CACHE_TTL) {
     urlCache.delete(url);
     return null;
   }
-  return entry.content;
+  return entry;
 }
 
-function setCache(url: string, content: ExtractedContent): void {
-  if (urlCache.size >= CACHE_MAX) {
+function getCached(url: string, mode: CacheMode): ExtractedContent | null {
+  return getCacheEntry(url)?.[mode] || null;
+}
+
+function setCache(url: string, payload: CachePayload): void {
+  const existing = getCacheEntry(url);
+
+  if (!existing && urlCache.size >= CACHE_MAX) {
     const oldest = urlCache.keys().next().value!;
     urlCache.delete(oldest);
   }
-  urlCache.set(url, { content, ts: Date.now() });
+
+  urlCache.set(url, {
+    ...(existing || {}),
+    ...payload,
+    ts: Date.now()
+  });
+}
+
+function isTextLikeContentType(contentType: string): boolean {
+  if (!contentType) return true;
+
+  const normalized = contentType.toLowerCase();
+  return normalized.startsWith("text/") ||
+    normalized.includes("html") ||
+    normalized.includes("json") ||
+    normalized.includes("xml") ||
+    normalized.includes("javascript");
+}
+
+function formatContentType(contentType: string): string {
+  return contentType.split(";")[0] || "unknown";
+}
+
+function isHtmlContentType(contentType: string): boolean {
+  const normalized = formatContentType(contentType).toLowerCase();
+  return normalized === "text/html" || normalized === "application/xhtml+xml";
+}
+
+async function readTextWithLimit(res: Response, limit: number): Promise<string> {
+  if (!res.body) {
+    const text = await res.text();
+    if (new TextEncoder().encode(text).length > limit) {
+      throw new Error("Content too large");
+    }
+    return text;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let size = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel();
+      throw new Error("Content too large");
+    }
+
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+
+  chunks.push(decoder.decode());
+  return chunks.join("");
+}
+
+function extractDomHeadings(root: Document | Element | null): string {
+  if (!root) return "No headings found.";
+
+  const headings = Array.from(root.querySelectorAll("h1, h2, h3, h4, h5, h6"))
+    .map(node => {
+      const level = Number(node.tagName[1]);
+      const text = node.textContent?.replace(/\s+/g, " ").trim();
+      return text ? `${"#".repeat(level)} ${text}` : "";
+    })
+    .filter(Boolean);
+
+  return headings.length > 0 ? headings.join("\n") : "No headings found.";
 }
 
 export function extractHeadings(markdown: string): string {
@@ -48,22 +128,10 @@ export interface FetchOptions {
   headingsOnly?: boolean;
 }
 
-function finalize(extracted: ExtractedContent, opts: FetchOptions): ExtractedContent {
-  setCache(extracted.url, extracted);
-  if (opts.headingsOnly) {
-    return { ...extracted, content: extractHeadings(extracted.content) };
-  }
-  return extracted;
-}
-
 export async function fetchContent(url: string, opts: FetchOptions = {}): Promise<ExtractedContent> {
-  const cached = getCached(url);
-  if (cached) {
-    if (opts.headingsOnly) {
-      return { ...cached, content: extractHeadings(cached.content) };
-    }
-    return cached;
-  }
+  const mode: CacheMode = opts.headingsOnly ? "headings" : "full";
+  const cached = getCached(url, mode);
+  if (cached) return cached;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
@@ -82,36 +150,66 @@ export async function fetchContent(url: string, opts: FetchOptions = {}): Promis
     }
 
     const contentLength = res.headers.get("content-length");
-    if (contentLength && parseInt(contentLength) > MAX_SIZE) {
+    if (contentLength && Number(contentLength) > MAX_SIZE) {
       return { url, title: "", content: "", error: "Content too large" };
     }
 
-    const contentType = res.headers.get("content-type") || "";
-    const body = await res.text();
-
-    if (contentType.includes("application/json")) {
-      return finalize({ url, title: url, content: "```json\n" + body + "\n```" }, opts);
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    if (contentType && !isTextLikeContentType(contentType)) {
+      return {
+        url,
+        title: "",
+        content: "",
+        error: `Unsupported content type: ${formatContentType(contentType)}`
+      };
     }
 
-    if (contentType.includes("text/plain")) {
-      return finalize({ url, title: url, content: body }, opts);
+    const body = await readTextWithLimit(res, MAX_SIZE);
+
+    if (contentType.includes("json")) {
+      const full: ExtractedContent = {
+        url,
+        title: url,
+        content: "```json\n" + body + "\n```"
+      };
+      const headings: ExtractedContent = { url, title: url, content: "No headings found." };
+      setCache(url, opts.headingsOnly ? { headings } : { full, headings });
+      return opts.headingsOnly ? headings : full;
+    }
+
+    if (contentType && !isHtmlContentType(contentType)) {
+      const full: ExtractedContent = { url, title: url, content: body };
+      const headings: ExtractedContent = { url, title: url, content: extractHeadings(body) };
+      setCache(url, opts.headingsOnly ? { headings } : { full, headings });
+      return opts.headingsOnly ? headings : full;
     }
 
     const { document } = parseHTML(body);
+    const title = document.querySelector("title")?.textContent || url;
+    const root = document.querySelector("main, article") || document.body || document.documentElement;
+    const headings: ExtractedContent = { url, title, content: extractDomHeadings(root) };
+
+    if (opts.headingsOnly) {
+      setCache(url, { headings });
+      return headings;
+    }
+
     const reader = new Readability(document);
     const article = reader.parse();
 
-    let markdown: string;
-    let title: string;
+    let full: ExtractedContent;
     if (article) {
-      title = article.title || url;
-      markdown = turndown.turndown(article.content);
+      full = {
+        url,
+        title: article.title || title,
+        content: turndown.turndown(article.content)
+      };
     } else {
-      title = document.querySelector("title")?.textContent || url;
-      markdown = turndown.turndown(body);
+      full = { url, title, content: turndown.turndown(body) };
     }
 
-    return finalize({ url, title, content: markdown }, opts);
+    setCache(url, { full, headings });
+    return full;
   } catch (err) {
     return {
       url,
