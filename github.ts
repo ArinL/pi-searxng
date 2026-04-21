@@ -40,7 +40,9 @@ export function isGitHubUrl(url: string): boolean {
 interface GitHubUrlInfo {
   owner: string;
   repo: string;
-  ref?: string; // branch/tag from blob/tree URLs
+  ref?: string;
+  type?: "blob" | "tree";
+  filePath?: string;
 }
 
 function parseGitHubUrl(url: string): GitHubUrlInfo | null {
@@ -56,11 +58,53 @@ function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 
     // Handle blob/tree URLs: github.com/owner/repo/blob/main/path/to/file
     let ref: string | undefined;
+    let type: "blob" | "tree" | undefined;
+    let filePath: string | undefined;
     if (segments.length >= 4 && (segments[2] === "blob" || segments[2] === "tree")) {
+      type = segments[2] as "blob" | "tree";
       ref = segments[3];
+      if (segments.length > 4) {
+        filePath = segments.slice(4).join("/");
+      }
     }
 
-    return { owner, repo, ref };
+    return { owner, repo, ref, type, filePath };
+  } catch {
+    return null;
+  }
+}
+
+export interface RawFile {
+  path: string;
+  content: string;
+  url: string;
+}
+
+export function isGitHubBlobUrl(url: string): boolean {
+  const info = parseGitHubUrl(url);
+  return !!(info?.type === "blob" && info.filePath);
+}
+
+export async function fetchRawFile(url: string): Promise<RawFile | null> {
+  const info = parseGitHubUrl(url);
+  if (!info || info.type !== "blob" || !info.filePath || !info.ref) return null;
+
+  const rawUrl = `https://raw.githubusercontent.com/${info.owner}/${info.repo}/${info.ref}/${info.filePath}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(rawUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "pi-searxng/1.0" }
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return null;
+
+    const content = await res.text();
+    return { path: info.filePath, content, url: rawUrl };
   } catch {
     return null;
   }

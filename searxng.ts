@@ -5,6 +5,7 @@ export interface SearchResult {
   url: string;
   snippet: string;
   score: number;
+  publishedDate?: string;
 }
 
 export interface SearchResponse {
@@ -71,7 +72,8 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
         title: r.title || "Untitled",
         url: r.url,
         snippet: r.content || r.abstract || "",
-        score: r.score || 0
+        score: r.score || 0,
+        publishedDate: r.publishedDate || undefined
       });
     }
 

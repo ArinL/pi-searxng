@@ -3,7 +3,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { search } from "./searxng.js";
 import { fetchContent } from "./extract.js";
-import { isGitHubUrl, cloneRepo } from "./github.js";
+import { isGitHubUrl, isGitHubBlobUrl, fetchRawFile, cloneRepo } from "./github.js";
 
 const searchCache = new Map<string, { query: string; results: any[] }>();
 
@@ -15,7 +15,8 @@ function formatSearchResults(results: any[]): string {
   if (results.length === 0) return "No results found.";
   return results.map((r, i) => {
     const score = r.score ? ` (${r.score.toFixed(2)})` : "";
-    return `${i + 1}. **${r.title}**${score}\n   ${r.url}\n   ${r.snippet.slice(0, 400)}${r.snippet.length > 400 ? "..." : ""}`;
+    const date = r.publishedDate ? ` · ${r.publishedDate}` : "";
+    return `${i + 1}. **${r.title}**${score}${date}\n   ${r.url}\n   ${r.snippet.slice(0, 400)}${r.snippet.length > 400 ? "..." : ""}`;
   }).join("\n\n");
 }
 
@@ -98,22 +99,42 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "Aborted" }] };
       }
 
+      if (isGitHubBlobUrl(params.url)) {
+        const file = await fetchRawFile(params.url);
+        if (!file) {
+          return {
+            content: [{ type: "text", text: "Failed to fetch file from GitHub" }],
+            details: { error: "Raw fetch failed" }
+          };
+        }
+
+        const truncated = file.content.length > 30000;
+        const content = truncated
+          ? file.content.slice(0, 30000) + "\n\n[Content truncated...]"
+          : file.content;
+
+        return {
+          content: [{ type: "text", text: `## ${file.path}\n\n\`\`\`\n${content}\n\`\`\`` }],
+          details: { path: file.path, length: file.content.length, truncated }
+        };
+      }
+
       if (isGitHubUrl(params.url)) {
         const repo = await cloneRepo(params.url);
-        
+
         if (!repo) {
           return {
             content: [{ type: "text", text: "Failed to clone repository" }],
             details: { error: "Clone failed" }
           };
         }
-        
+
         const output = `## Repository Cloned\n\n**Path:** \`${repo.localPath}\`\n\n**Files (${repo.files.length}):**\n${formatRepoFiles(repo.files)}\n\n---\n\nUse \`read\` tool to explore files.`;
-        
+
         return {
           content: [{ type: "text", text: output }],
-          details: { 
-            localPath: repo.localPath, 
+          details: {
+            localPath: repo.localPath,
             fileCount: repo.files.length,
             files: repo.files.slice(0, 10).map(f => f.path)
           }
@@ -147,17 +168,21 @@ export default function (pi: ExtensionAPI) {
     
     renderCall(args, theme) {
       const url = (args as any).url || "";
-      const isGH = isGitHubUrl(url);
+      const isBlob = isGitHubBlobUrl(url);
+      const isGH = !isBlob && isGitHubUrl(url);
       const display = url.length > 50 ? url.slice(0, 47) + "..." : url;
-      const prefix = isGH ? "clone " : "fetch ";
-      const color = isGH ? "warning" : "accent";
+      const prefix = isBlob ? "raw " : isGH ? "clone " : "fetch ";
+      const color = isGH || isBlob ? "warning" : "accent";
       return new Text(theme.fg("toolTitle", prefix) + theme.fg(color, display), 0, 0);
     },
-    
+
     renderResult(result, _opts, theme) {
       const details = result.details as any;
       if (details?.localPath) {
         return new Text(theme.fg("success", `cloned`) + theme.fg("muted", ` ${details.fileCount} files`), 0, 0);
+      }
+      if (details?.path) {
+        return new Text(theme.fg("success", details.path) + (details?.truncated ? theme.fg("warning", " [truncated]") : ""), 0, 0);
       }
       const length = details?.length || 0;
       return new Text(theme.fg("success", `${length} chars`) + (details?.truncated ? theme.fg("warning", " [truncated]") : ""), 0, 0);
