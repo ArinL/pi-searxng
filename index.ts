@@ -15,7 +15,7 @@ function formatSearchResults(results: any[]): string {
   if (results.length === 0) return "No results found.";
   return results.map((r, i) => {
     const score = r.score ? ` (${r.score.toFixed(2)})` : "";
-    return `${i + 1}. **${r.title}**${score}\n   ${r.url}\n   ${r.snippet.slice(0, 200)}${r.snippet.length > 200 ? "..." : ""}`;
+    return `${i + 1}. **${r.title}**${score}\n   ${r.url}\n   ${r.snippet.slice(0, 400)}${r.snippet.length > 400 ? "..." : ""}`;
   }).join("\n\n");
 }
 
@@ -38,7 +38,9 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("month"),
         Type.Literal("year")
       ], { description: "Filter results by time range" })),
-      language: Type.Optional(Type.String({ description: "Language code (e.g. 'en', 'fr'). Default: all" }))
+      language: Type.Optional(Type.String({ description: "Language code (e.g. 'en', 'fr'). Default: all" })),
+      categories: Type.Optional(Type.String({ description: "SearXNG categories: general, news, science, it, files, social media" })),
+      engines: Type.Optional(Type.String({ description: "Comma-separated engines (e.g. 'google,wikipedia,stackoverflow')" }))
     }),
 
     async execute(_id, params, signal) {
@@ -51,7 +53,9 @@ export default function (pi: ExtensionAPI) {
           limit: params.limit,
           pageno: params.pageno,
           time_range: params.time_range,
-          language: params.language
+          language: params.language,
+          categories: params.categories,
+          engines: params.engines
         });
         const searchId = generateId();
         searchCache.set(searchId, { query: params.query, results });

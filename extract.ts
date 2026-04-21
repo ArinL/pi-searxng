@@ -77,20 +77,44 @@ export async function fetchContent(url: string, opts: FetchOptions = {}): Promis
       return { url, title: "", content: "", error: "Content too large" };
     }
 
-    const html = await res.text();
-    const { document } = parseHTML(html);
+    const contentType = res.headers.get("content-type") || "";
+    const body = await res.text();
+
+    // Handle non-HTML content types directly
+    if (contentType.includes("application/json")) {
+      const extracted: ExtractedContent = {
+        url,
+        title: url,
+        content: "```json\n" + body + "\n```"
+      };
+      setCache(url, extracted);
+      if (opts.headingsOnly) return { ...extracted, content: "No headings (JSON content)." };
+      return extracted;
+    }
+
+    if (contentType.includes("text/plain")) {
+      const extracted: ExtractedContent = { url, title: url, content: body };
+      setCache(url, extracted);
+      if (opts.headingsOnly) return { ...extracted, content: extractHeadings(body) };
+      return extracted;
+    }
+
+    // HTML: try Readability first, fall back to raw Turndown
+    const { document } = parseHTML(body);
     const reader = new Readability(document);
     const article = reader.parse();
 
-    if (!article) {
-      return { url, title: "", content: "", error: "Could not extract content" };
+    let markdown: string;
+    let title: string;
+    if (article) {
+      title = article.title || url;
+      markdown = turndown.turndown(article.content);
+    } else {
+      title = document.querySelector("title")?.textContent || url;
+      markdown = turndown.turndown(body);
     }
 
-    const extracted: ExtractedContent = {
-      url,
-      title: article.title || url,
-      content: turndown.turndown(article.content)
-    };
+    const extracted: ExtractedContent = { url, title, content: markdown };
 
     setCache(url, extracted);
 
