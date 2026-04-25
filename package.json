@@ -12,7 +12,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jcha0713/pi-searxng"
+    "url": "https://github.com/arinl/pi-searxng"
   },
   "files": [
     "index.ts",
