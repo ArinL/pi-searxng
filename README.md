@@ -1,12 +1,13 @@
 # pi-searxng
 
-SearXNG web search extension for [Pi](https://github.com/badlogic/pi-mono) with automatic GitHub repository cloning.
+SearXNG web search and HTML-to-markdown fetch extension for [Pi](https://github.com/badlogic/pi-mono).
 
 ## Features
 
-- **Web Search** - Search the web via SearXNG instance
-- **Content Fetching** - Extract article content from URLs (converts HTML to Markdown)
-- **Auto GitHub Cloning** - Automatically clones GitHub repos when fetching GitHub URLs
+- **Web Search** — search the web via a SearXNG instance.
+- **Content Fetching** — fetch a URL and convert its HTML to markdown via Readability + turndown. JSON and plain-text content are returned as-is.
+
+GitHub-specific operations (repo trees, files, issues, PRs, workflows, releases) are deliberately **out of scope** — use the `gh` CLI via your shell tool instead.
 
 ## Installation
 
@@ -32,7 +33,7 @@ Create `~/.pi/searxng.json`:
 }
 ```
 
-Or use environment variable:
+Or set the SearXNG URL via env var:
 
 ```bash
 export SEARXNG_URL=http://localhost:8080
@@ -42,33 +43,20 @@ export SEARXNG_URL=http://localhost:8080
 
 ### `web_search`
 
-Search the web using SearXNG.
-
-**Parameters:**
-- `query` (string, required) - Search query
-- `limit` (number, optional) - Max results (default: 10)
+Search the web using SearXNG. Supports time filtering, pagination, language, categories, and engine selection.
 
 ### `fetch_content`
 
-Fetch URL content. Automatically clones GitHub repositories.
-
-**Parameters:**
-- `url` (string, required) - URL to fetch
-
-For GitHub URLs, the repo is cloned to a temp directory and file listings are returned.
+Fetch a URL and return markdown. Use `headingsOnly: true` to scout long pages.
 
 ### `get_search_results`
 
-Retrieve cached search results by ID.
-
-**Parameters:**
-- `searchId` (string, required) - Search ID from previous `web_search` call
+Retrieve cached search results by `searchId`.
 
 ## System Requirements
 
 - Node.js 18+
-- `git` command (for GitHub cloning)
-- SearXNG instance (for web search)
+- SearXNG instance
 
 ## License
 

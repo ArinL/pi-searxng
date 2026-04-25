@@ -1,14 +1,13 @@
 {
   "name": "pi-searxng",
-  "version": "1.3.1",
-  "description": "SearXNG web search extension for Pi with API-first GitHub content fetching",
+  "version": "2.0.0",
+  "description": "SearXNG web search and HTML-to-markdown fetch extension for Pi",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "searxng",
-    "web-search",
-    "github"
+    "web-search"
   ],
   "license": "MIT",
   "repository": {
@@ -20,7 +19,6 @@
     "searxng.ts",
     "config.ts",
     "extract.ts",
-    "github.ts",
     "package.json",
     "README.md"
   ],

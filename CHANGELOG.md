@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-04-25
+
+### Removed (BREAKING)
+- All GitHub-specific handling: deleted `github.ts`, removed the `clone_repo` tool, and removed the GitHub repo/tree/blob branches from `fetch_content`. GitHub URLs now flow through the generic Readability path. Use the `gh` CLI for GitHub-specific reads (trees, issues, PRs, workflows, releases).
+- `git` subprocess dependency.
+
 ## [1.0.4] - 2025-03-01
 
 ### Changed
